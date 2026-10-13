@@ -612,10 +612,154 @@ az aks upgrade \
 
 若要把这些脚本从“文件”升级成真正的节点初始化行为，应另行设计受支持的节点生命周期机制，逐项处理下表中的环境依赖、幂等、失败恢复、权限、网络来源、密钥管理和磁盘安全，并在非生产环境测试。不要直接把完整主脚本改成 `NodeImageBuildTime` customization。
 
+### 7.7 RTX PRO 6000 Spot + PIS canary 结果
+
+在 West US 2 的隔离 AKS 集群 `aks-rtx-pis-wus2-lab`（Kubernetes `1.36.1`，NAP mode `Auto`）中，普通按需 RTX pool 的 PIS builder 曾因 `AllocationFailed` 失败；随后用同一 SKU、同一 PIS version 改用 Spot 创建成功。**因此，Spot 确实拿到了一台 RTX PRO 6000 VM，但这不是容量保证，也不能据此保证以后可再次分配。**
+
+**测试范围更正：** 原 `pis-rtx6000-wus2/v1` 与 Spot pool `rtxspot` 使用 managed GPU；它们只验证了 RTX Spot 分配、AKS-managed driver、节点 Ready 和 GPU resource，**没有验证 PIS 自定义 driver**。此前两次 PIS 自定义驱动构建使用了通用 NVIDIA runfile，均失败；Ubuntu `595.91.07` server 包虽能安装并编译 DKMS module，但不能加载 PCI ID `10de:2bb5`。随后查到 Microsoft 为 NCv6 RTX PRO 6000 BSE 发布的 Azure GRID vGPU runfile；本地 RTX customization 已改为官方 Azure vGPU20.2 `595.91.07` 包，正在用新的 PIS version 重新验证。配置及限制见 [PIS customization JSON 说明](./pis-scripts-explained.md)。
+
+本次 Spot pool 是显式创建的 AKS node pool；集群启用 NAP 不代表该 pool 由 NAP 自动配置。创建示例：
+
+```bash
+export PIS_VERSION_ID="$(
+  az aks prepared-image-specification version show \
+    --resource-group "${PIS_RESOURCE_GROUP}" \
+    --pis-name "${PIS_NAME}" \
+    --name "${PIS_VERSION}" \
+    --query id -o tsv
+)"
+
+az aks nodepool add \
+  --resource-group "${RESOURCE_GROUP}" \
+  --cluster-name "${CLUSTER_NAME}" \
+  --name rtxspot \
+  --node-vm-size Standard_NC36ds_xl_RTXPRO6000BSE_v6 \
+  --node-count 1 \
+  --priority Spot \
+  --eviction-policy Delete \
+  --spot-max-price -1 \
+  --pis-id "${PIS_VERSION_ID}" \
+  --enable-managed-gpu true \
+  --ssh-access disabled \
+  --no-wait
+
+az aks nodepool wait \
+  --custom "provisioningState=='Failed' || provisioningState=='Succeeded'" \
+  --interval 30 --timeout 1800 \
+  --resource-group "${RESOURCE_GROUP}" \
+  --cluster-name "${CLUSTER_NAME}" \
+  --name rtxspot
+```
+
+`--spot-max-price -1` 表示最高可按需价格，不代表固定 Spot 价格；Spot VM 可被 Azure 驱逐。执行前确认工作负载可中断、重试和迁移，并评估 Spot 价格及维护影响。正式创建时显式设置 `--ssh-access disabled`，避免沿用 CLI 提示的默认 SSH 设置。
+
+| 项目 | 实测结果 |
+| --- | --- |
+| Pool / PIS | `rtxspot` / `pis-rtx6000-wus2/v1`；node pool `Succeeded`，PIS profile 指向该 version |
+| SKU / 优先级 | `Standard_NC36ds_xl_RTXPRO6000BSE_v6` / `Spot`，eviction policy `Delete` |
+| AKS operation | `2026-10-13T06:18:41.239Z` Started，`2026-10-13T06:45:04.313Z` Succeeded，约 **26 分 23 秒** |
+| VM / Kubernetes 状态 | VMSS instance `0` 于 `2026-10-13T06:44:31.928Z` 报告 `Provisioning succeeded`、`VM running`；`az aks command invoke` 确认 node `Ready`、`nvidia.com/gpu` capacity/allocatable 均为 `1` |
+| GPU/driver | VMSS Run Command 执行 `nvidia-smi` 返回 `NVIDIA RTX Pro 6000 Blackwell DC-1-24Q, 24576 MiB, 595.58.03` |
+| Kubernetes API 访问 | 本机普通与 admin kubeconfig 直接请求 API 均返回 `Forbidden`；通过 `az aks command invoke` 完成只读验证，node `Ready` 且 GPU 可被 scheduler 分配 |
+
+**规格解释：** `NC36ds_xl` 本次实际暴露的是 `DC-1-24Q` / 24,576 MiB GPU profile，不是整张 96 GB GPU 的单 VM 配置。Microsoft Learn 将该系列标为每个物理 GPU 96 GB、VM size 从 1/4 到 2 个 GPU；应按 VM 实际 `nvidia-smi` 输出区分分区与整卡。该测试证明 Spot + PIS 能启动并向 Kubernetes 暴露一个 RTX PRO 6000 GPU 资源；尚未运行 CUDA/AI workload 性能基准。
+
+### 7.8 RTX PIS 自定义 driver canary 实测与修正
+
+**验证通过（2026-10-13）：PIS 预置自定义 GRID driver，GPU Operator 提供 Toolkit 和 device plugin，GPU Pod 已完成真实 CUDA 计算。**
+
+| 项目 | 当前配置 |
+| --- | --- |
+| Cluster / pool | `aks-rtx-pis-wus2-lab` / `rtxcustom` |
+| SKU / GPU | `Standard_NC24lds_xl_RTXPRO6000BSE_v6` Spot / RTX PRO 6000 `DC-1-24Q`，24 GiB |
+| PIS version / driver | `custom-azure-grid-595.91.07-v5-postready-restore` / Azure GRID `595.91.07` |
+| GPU stack | GPU Operator v26.7.2 / Toolkit v1.20.1 / device plugin v0.20.1 |
+| 节点环境 | AKS `1.36.1`，Ubuntu 24.04.5，kernel `6.8.0-1067-azure`，containerd `2.3.3-2` |
+
+#### 关键配置
+
+1. 使用 [Azure NCv6 GRID driver](https://learn.microsoft.com/en-us/azure/virtual-machines/linux/n-series-driver-setup)，不用通用 NVIDIA runfile 或 Ubuntu driver 包。
+2. 自定义 pool 设置 `--gpu-driver None --enable-managed-gpu false`；Operator 设置 `driver.enabled=false`，保留 PIS driver。
+3. 节点 Ready 后，由 [`rtx6000-module-restore-daemonset.yaml`](../azure-init-review/rtx6000-module-restore-daemonset.yaml) 恢复并加载 PIS 归档的模块，不修改 kubelet。
+4. Toolkit 设置 `RUNTIME_CONFIG_SOURCE=file`，从磁盘读取 containerd 配置，生成与 AKS 根配置兼容的 version 2 drop-in。
+
+完整配置见 [`gpu-operator-rtx6000-values.yaml`](../azure-init-review/gpu-operator-rtx6000-values.yaml)，核心参数如下：
+
+```yaml
+driver:
+  enabled: false
+hostPaths:
+  driverInstallDir: /opt/aks-custom-nvidia-driver/root
+toolkit:
+  enabled: true
+  env:
+    - name: RUNTIME_CONFIG_SOURCE
+      value: file
+devicePlugin:
+  enabled: true
+```
+
+`hostPaths.driverInstallDir` 指向 PIS 归档的 driver libraries 和 `nvidia-smi`。完整 values 还包含 RTX pool 的 NFD worker selector 和 Spot toleration；`mig.strategy=single` 暴露一个 GPU，关闭 MIG manager 以保留 Azure 提供的 partition。本次未启用 DCGM exporter。
+
+#### 验证结果
+
+| 验证项 | 实测结果 |
+| --- | --- |
+| 节点及组件 | 两节点、ClusterPolicy、Toolkit、device plugin、validator 均 Ready |
+| containerd | 根配置和 NVIDIA drop-in 均为 version 2 |
+| 活动驱动 | PIS 的 `595.91.07`，Operator 不安装 driver |
+| GPU 资源 | `nvidia.com/gpu` capacity / allocatable = `1 / 1` |
+| Operator CUDA validator | 50,000 元素向量加法通过 |
+| 独立 GPU Job | CUDA kernel 的 65,536 个结果全部校验通过；Job Complete |
+
+独立测试见 [`rtx6000-cuda-smoke-job.yaml`](../azure-init-review/rtx6000-cuda-smoke-job.yaml)：申请一个 GPU，使用 `runtimeClassName=nvidia`，通过 CUDA Driver API 执行 PTX kernel 并校验结果。此结果证明调度和 GPU 计算可用；性能对照、长期稳定性及完整 Operator stack 的重启/节点替换恢复尚未测试。
+
+#### 安装和验证命令
+
+从项目根目录运行。实验集群本机直连 API 为 Forbidden，因此使用 `az aks command invoke`：
+
+```bash
+az aks command invoke \
+  --resource-group rg-rtx-pis-wus2-lab \
+  --name aks-rtx-pis-wus2-lab \
+  --file azure-init-review/gpu-operator-rtx6000-values.yaml \
+  --command 'set -eu;
+    helm repo add nvidia https://helm.ngc.nvidia.com/nvidia;
+    helm repo update nvidia;
+    helm upgrade --install gpu-operator nvidia/gpu-operator \
+      --version v26.7.2 --namespace gpu-operator --create-namespace \
+      -f gpu-operator-rtx6000-values.yaml;
+    kubectl wait --for=condition=Ready clusterpolicy/cluster-policy --timeout=300s;
+    kubectl -n gpu-operator get pods -o wide'
+
+az aks command invoke \
+  --resource-group rg-rtx-pis-wus2-lab \
+  --name aks-rtx-pis-wus2-lab \
+  --file azure-init-review/rtx6000-cuda-smoke-job.yaml \
+  --command 'set -eu;
+    kubectl apply -f rtx6000-cuda-smoke-job.yaml;
+    kubectl -n gpu-operator wait --for=condition=complete job/rtx6000-cuda-smoke --timeout=480s;
+    kubectl -n gpu-operator logs job/rtx6000-cuda-smoke'
+```
+
+已完成的 Job 保留在集群中，可直接检查日志。再次 apply 不会重新计算；重测时，确认旧 Job 已完成后，仅删除 `gpu-operator` namespace 中的 `rtx6000-cuda-smoke` Job，再重新 apply。
+
 ## 8. 相关文档
 
 - [PIS 概述：Prepared Image Specification (PIS) in Azure Kubernetes Service (AKS) (Preview)](https://learn.microsoft.com/en-us/azure/aks/prepared-image-specification-overview)
 - [创建和管理 AKS Prepared Image Specification (PIS) (Preview)](https://learn.microsoft.com/en-us/azure/aks/prepared-image-specification)
+- [PIS customization JSON 说明](./pis-scripts-explained.md)
+- [AKS 自管 NVIDIA GPU driver](https://learn.microsoft.com/en-us/azure/aks/use-nvidia-gpu)
+- [Azure NCv6 RTX PRO 6000 BSE Linux GRID driver setup](https://learn.microsoft.com/en-us/azure/virtual-machines/linux/n-series-driver-setup)
+- [NCv6 RTX PRO 6000 Blackwell v6 series overview](https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/gpu-accelerated/nc-rtxpro6000-bse-v6-series-overview)
+- [AKS managed GPU node pool](https://learn.microsoft.com/en-us/azure/aks/aks-managed-gpu-nodes)
+- [NVIDIA GPU Operator on AKS](https://learn.microsoft.com/en-us/azure/aks/nvidia-gpu-operator)
+- [NVIDIA GPU Operator issue #2646: AKS / Ubuntu 24.04 / containerd 2.3.x Toolkit workaround](https://github.com/NVIDIA/gpu-operator/issues/2646)
+- [NVIDIA GPU Operator v26.7.2 Helm values](https://github.com/NVIDIA/gpu-operator/blob/v26.7.2/deployments/gpu-operator/values.yaml)
+- [NVIDIA GPU Operator v26.7.2 runtime config source handling](https://github.com/NVIDIA/gpu-operator/blob/v26.7.2/controllers/object_controls.go)
+- [NVIDIA Container Toolkit v1.20.1 runtime config source option](https://github.com/NVIDIA/nvidia-container-toolkit/blob/v1.20.1/cmd/nvidia-ctk-installer/container/runtime/runtime.go)
+- [NC RTX PRO 6000 Blackwell Server Edition v6 VM sizes](https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/gpu-accelerated/nc-rtxpro6000-bse-v6-series)
+- [Add an Azure Spot node pool to an AKS cluster](https://learn.microsoft.com/en-us/azure/aks/spot-node-pool)
 - [AKS Support Policies / agent node shared responsibility](https://learn.microsoft.com/en-us/azure/aks/support-policies#shared-responsibility)
 - [Customize the Node Configuration for AKS Node Pools](https://learn.microsoft.com/en-us/azure/aks/custom-node-configuration)
 - [DNS in AKS](https://learn.microsoft.com/en-us/azure/aks/dns-concepts)

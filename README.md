@@ -7,17 +7,21 @@ The generated PIS customization installs the review files under
 `/opt/azure-init-review` in the prepared image. It validates and copies the
 files, but **does not execute any of the bundled initialization scripts**.
 
-> [!WARNING]
-> The scripts contain redacted host names, addresses, credentials, and user
-> names. They are review material only and must not be run on production or
-> development nodes.
+The review examples contain redacted host names, addresses, credentials, and
+user names; treat them as documentation examples, not deployable configuration.
 
-## What this project 
+## What this project contains
 
 | Path | Purpose |
 | --- | --- |
 | `azure-init-review/` | Sanitized scripts, checksums, and generated PIS JSON |
 | `tools/build_azure_init_pis.py` | Verifies the bundle and generates `pis-scripts.json` |
+| `azure-init-review/rtx6000-driver-install.sh` | Installs the Microsoft-redistributed Azure GRID vGPU driver for RTX PRO 6000 BSE |
+| `tools/build_rtx6000_pis.py` | Validates the RTX installer and generates `pis-scripts-rtx6000.json` |
+| `azure-init-review/pis-scripts-rtx6000.json` | PIS customization that installs the Azure GRID driver during image build |
+| `azure-init-review/gpu-operator-rtx6000-values.yaml` | Tested GPU Operator values using the PIS driver root and file-based containerd config |
+| `azure-init-review/rtx6000-cuda-smoke-job.yaml` | GPU-requesting Job that runs and verifies a real CUDA kernel |
+| `docs/pis-scripts-explained.md` | Explains both PIS JSON files, RTX vGPU driver selection, and AKS managed-driver boundaries |
 | `docs/azure-init-review-runbook.md` | Safe deployment and verification runbook |
 | `docs/manual.md` | General end-to-end AKS PIS Bash example |
 
@@ -91,10 +95,33 @@ To write the result to another location:
 python3 tools/build_azure_init_pis.py --output /tmp/pis-scripts.json
 ```
 
+To generate the RTX custom-driver PIS JSON:
+
+```bash
+python3 tools/build_rtx6000_pis.py
+```
+
+The RTX installer uses the Microsoft-redistributed Azure GRID vGPU runfile
+recommended for the NCv6 RTX PRO 6000 BSE series. Generic NVIDIA runfiles and
+Ubuntu driver packages are not substitutes for this vGPU-specific artifact.
+The tested setup uses PIS version
+`custom-azure-grid-595.91.07-v5-postready-restore` to package the custom
+driver, a pool-scoped DaemonSet to restore modules after node readiness,
+and GPU Operator v26.7.2 / Toolkit v1.20.1 for GPU container support.
+Operator driver installation is disabled; `RUNTIME_CONFIG_SOURCE=file`
+keeps its containerd configuration compatible with AKS.
+
+The RTX Spot node is Ready with one allocatable GPU. Both the Operator
+CUDA validator and the independent CUDA kernel Job passed. Performance
+comparisons and long-term stability have not been measured. See
+[the PIS runbook](docs/azure-init-review-runbook.md) and
+[the customization explanation](docs/pis-scripts-explained.md).
+
 ### 3. Inspect the generated JSON
 
 ```bash
 python3 -m json.tool azure-init-review/pis-scripts.json >/dev/null
+python3 -m json.tool azure-init-review/pis-scripts-rtx6000.json >/dev/null
 ```
 
 The JSON contains one Bash customization named

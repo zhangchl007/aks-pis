@@ -1,0 +1,129 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rtx6000-cuda-smoke
+  namespace: gpu-operator
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 600
+  template:
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      nodeSelector:
+        agentpool: rtxcustom
+      tolerations:
+        - key: kubernetes.azure.com/scalesetpriority
+          operator: Equal
+          value: spot
+          effect: NoSchedule
+      containers:
+        - name: cuda-smoke
+          image: python:3.12-slim-bookworm
+          imagePullPolicy: IfNotPresent
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+          command: [python, -u, -c]
+          args:
+            - |
+              import ctypes as c
+              import subprocess
+              import time
+
+              subprocess.run(["nvidia-smi"], check=True)
+              cuda = c.CDLL("libcuda.so.1")
+
+              def bind(name, argtypes):
+                  fn = getattr(cuda, name)
+                  fn.argtypes = argtypes
+                  fn.restype = c.c_int
+                  return fn
+
+              def check(fn, *args):
+                  result = fn(*args)
+                  if result:
+                      raise RuntimeError(f"{fn.__name__} failed with CUDA error {result}")
+
+              ptr = c.c_void_p
+              init = bind("cuInit", [c.c_uint])
+              count_fn = bind("cuDeviceGetCount", [c.POINTER(c.c_int)])
+              get_device = bind("cuDeviceGet", [c.POINTER(c.c_int), c.c_int])
+              get_name = bind("cuDeviceGetName", [ptr, c.c_int, c.c_int])
+              create_ctx = bind("cuCtxCreate_v2", [c.POINTER(ptr), c.c_uint, c.c_int])
+              destroy_ctx = bind("cuCtxDestroy_v2", [ptr])
+              alloc = bind("cuMemAlloc_v2", [c.POINTER(c.c_uint64), c.c_size_t])
+              free = bind("cuMemFree_v2", [c.c_uint64])
+              h_to_d = bind("cuMemcpyHtoD_v2", [c.c_uint64, ptr, c.c_size_t])
+              d_to_h = bind("cuMemcpyDtoH_v2", [ptr, c.c_uint64, c.c_size_t])
+              load = bind("cuModuleLoadData", [c.POINTER(ptr), ptr])
+              unload = bind("cuModuleUnload", [ptr])
+              get_fn = bind("cuModuleGetFunction", [c.POINTER(ptr), ptr, c.c_char_p])
+              launch = bind("cuLaunchKernel", [
+                  ptr, c.c_uint, c.c_uint, c.c_uint,
+                  c.c_uint, c.c_uint, c.c_uint, c.c_uint, ptr, ptr, ptr,
+              ])
+              sync = bind("cuCtxSynchronize", [])
+              check(init, 0)
+              count = c.c_int()
+              check(count_fn, c.byref(count))
+              if count.value != 1:
+                  raise RuntimeError(f"Expected one allocated CUDA device, got {count.value}")
+              device = c.c_int()
+              check(get_device, c.byref(device), 0)
+              name = c.create_string_buffer(256)
+              check(get_name, name, len(name), device)
+              print(f"CUDA device: {name.value.decode()}")
+              context = ptr()
+              check(create_ctx, c.byref(context), 0, device)
+              n = 65536
+              inputs = (c.c_float * n)(*(float(i % 1024) for i in range(n)))
+              output = (c.c_float * n)()
+              memory = c.c_uint64()
+              module = ptr()
+              try:
+                  check(alloc, c.byref(memory), c.sizeof(inputs))
+                  check(h_to_d, memory, inputs, c.sizeof(inputs))
+                  ptx = c.create_string_buffer(b"""
+              .version 8.0
+              .target sm_80
+              .address_size 64
+              .visible .entry double_values(.param .u64 data) {
+                  .reg .b32 %r<5>;
+                  .reg .b64 %rd<4>;
+                  .reg .f32 %f<3>;
+                  ld.param.u64 %rd1, [data];
+                  mov.u32 %r1, %ctaid.x;
+                  mov.u32 %r2, %ntid.x;
+                  mov.u32 %r3, %tid.x;
+                  mad.lo.s32 %r4, %r1, %r2, %r3;
+                  mul.wide.u32 %rd2, %r4, 4;
+                  add.u64 %rd3, %rd1, %rd2;
+                  ld.global.f32 %f1, [%rd3];
+                  add.f32 %f2, %f1, %f1;
+                  st.global.f32 [%rd3], %f2;
+                  ret;
+              }
+              """)
+                  check(load, c.byref(module), ptx)
+                  kernel = ptr()
+                  check(get_fn, c.byref(kernel), module, b"double_values")
+                  parameters = (ptr * 1)(c.cast(c.byref(memory), ptr))
+                  start = time.monotonic()
+                  check(launch, kernel, n // 256, 1, 1, 256, 1, 1, 0, None, parameters, None)
+                  check(sync)
+                  elapsed = time.monotonic() - start
+                  check(d_to_h, output, memory, c.sizeof(output))
+                  for i, value in enumerate(output):
+                      expected = inputs[i] * 2
+                      if value != expected:
+                          raise RuntimeError(f"Output mismatch at {i}: {value} != {expected}")
+                  print(f"PASS: GPU kernel verified all {n} float results; "
+                        f"launch + synchronize wall time {elapsed * 1000:.3f} ms "
+                        "(smoke test, not a performance benchmark)")
+              finally:
+                  if module.value:
+                      check(unload, module)
+                  if memory.value:
+                      check(free, memory)
+                  check(destroy_ctx, context)

@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: aks-custom-nvidia-module-restore
+  namespace: kube-system
+  labels:
+    app: aks-custom-nvidia-module-restore
+spec:
+  selector:
+    matchLabels:
+      app: aks-custom-nvidia-module-restore
+  template:
+    metadata:
+      labels:
+        app: aks-custom-nvidia-module-restore
+    spec:
+      nodeSelector:
+        agentpool: rtxcustom
+      tolerations:
+        - key: kubernetes.azure.com/scalesetpriority
+          operator: Equal
+          value: spot
+          effect: NoSchedule
+      initContainers:
+        - name: restore-modules
+          image: mcr.microsoft.com/azurelinux/busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -ec
+            - chroot /host /usr/local/sbin/aks-custom-nvidia-restore-modules
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+              mountPropagation: HostToContainer
+            - name: host-proc
+              mountPath: /host/proc
+            - name: host-sys
+              mountPath: /host/sys
+            - name: host-dev
+              mountPath: /host/dev
+      containers:
+        - name: hold
+          image: mcr.microsoft.com/azurelinux/busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -ec
+            - sleep 2147483647
+          readinessProbe:
+            exec:
+              command:
+                - test
+                - -c
+                - /host/dev/nvidia-uvm
+            periodSeconds: 10
+            timeoutSeconds: 2
+          volumeMounts:
+            - name: host-dev
+              mountPath: /host/dev
+              readOnly: true
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory
+        - name: host-proc
+          hostPath:
+            path: /proc
+            type: Directory
+        - name: host-sys
+          hostPath:
+            path: /sys
+            type: Directory
+        - name: host-dev
+          hostPath:
+            path: /dev
+            type: Directory
