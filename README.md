@@ -104,16 +104,21 @@ python3 tools/build_rtx6000_pis.py
 The RTX installer uses the Microsoft-redistributed Azure GRID vGPU runfile
 recommended for the NCv6 RTX PRO 6000 BSE series. Generic NVIDIA runfiles and
 Ubuntu driver packages are not substitutes for this vGPU-specific artifact.
-The tested setup uses PIS version
-`custom-azure-grid-595.91.07-v5-postready-restore` to package the custom
-driver, a pool-scoped DaemonSet to restore modules after node readiness,
-and GPU Operator v26.7.2 / Toolkit v1.20.1 for GPU container support.
-Operator driver installation is disabled; `RUNTIME_CONFIG_SOURCE=file`
-keeps its containerd configuration compatible with AKS.
+The tested native-driver setup uses PIS version
+`custom-azure-grid-595.91.07-v6-native-modules`. It retires the inherited
+managed CUDA driver cache marker after replacement, preventing AKS cleanup
+from deleting the custom GRID modules and tools. Modules load through
+`modules-load.d`, without a recovery DaemonSet or kubelet hooks.
+GPU Operator v26.7.2 / Toolkit v1.20.1 automatically detects the pre-installed
+host driver, with driver installation disabled; `RUNTIME_CONFIG_SOURCE=file` keeps
+its containerd configuration compatible with AKS.
 
-The RTX Spot node is Ready with one allocatable GPU. Both the Operator
-CUDA validator and the independent CUDA kernel Job passed. Performance
-comparisons and long-term stability have not been measured. See
+The deletion root cause was reproduced and fixed. Eight local regression
+tests pass. A clean 0-to-1 scale-out reached node readiness in 1m 37s and
+completed CUDA validation in 2m 31s, without a recovery DaemonSet, manual
+module loading, or device-node repair. Both the Operator CUDA validator
+and the independent 65,536-result GPU Job passed.
+Performance comparisons and long-term stability have not been measured. See
 [the PIS runbook](docs/azure-init-review-runbook.md) and
 [the customization explanation](docs/pis-scripts-explained.md).
 

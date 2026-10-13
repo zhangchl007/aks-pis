@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -26,26 +25,6 @@ def main() -> int:
     )
     if result.returncode:
         raise SystemExit(f"RTX driver customization failed bash -n:\n{result.stderr}")
-
-    restore_script_match = re.search(
-        r"""cat > "\$\{RESTORE_SCRIPT\}" <<'EOF'\n(.*?)\nEOF""",
-        script,
-        re.DOTALL,
-    )
-    if restore_script_match is None:
-        raise SystemExit("RTX driver customization is missing its module-restore script.")
-
-    restore_result = subprocess.run(
-        ["bash", "-n"],
-        input=restore_script_match.group(1),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if restore_result.returncode:
-        raise SystemExit(
-            f"NVIDIA module-restore script failed bash -n:\n{restore_result.stderr}"
-        )
 
     forbidden_kubelet_changes = (
         "kubelet.service",
@@ -87,8 +66,8 @@ def main() -> int:
     temporary_path.replace(OUTPUT_PATH)
     print(f"Wrote {OUTPUT_PATH}")
     print("Driver: Microsoft-redistributed Azure GRID vGPU 595.91.07 (open kernel module, DKMS)")
-    print("Kernel modules and a restore helper are staged under /opt and /usr/local/sbin.")
-    print("After a node is Ready, use rtx6000-module-restore-daemonset.yaml to restore modules without modifying kubelet.")
+    print("The inherited AKS managed-driver cache marker is retired after driver replacement.")
+    print("Kernel modules load through modules-load.d; no module-recovery DaemonSet or kubelet hook.")
     print("This is the NCv6 RTX PRO 6000 BSE vGPU package documented by Microsoft Learn.")
     return 0
 

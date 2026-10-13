@@ -1,7 +1,5 @@
 driver:
   enabled: false
-hostPaths:
-  driverInstallDir: /opt/aks-custom-nvidia-driver/root
 toolkit:
   enabled: true
   env:

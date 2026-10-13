@@ -11,7 +11,7 @@
 | [`rtx6000-driver-install.sh`](../azure-init-review/rtx6000-driver-install.sh) | RTX JSON 中 Bash 脚本的可读源文件 | 下载并校验 Azure GRID vGPU artifact，以 DKMS 安装 open kernel module |
 | [`build_azure_init_pis.py`](../tools/build_azure_init_pis.py) | 旧审阅包 JSON 生成器 | 校验审阅包 checksums 和 shell 语法，生成旧 `pis-scripts.json` |
 | [`build_rtx6000_pis.py`](../tools/build_rtx6000_pis.py) | RTX driver JSON 生成器 | 从安装脚本生成 RTX JSON，并检查 Bash 语法 |
-| [`gpu-operator-rtx6000-values.yaml`](../azure-init-review/gpu-operator-rtx6000-values.yaml) | GPU Operator 实测配置 | 禁用 driver 安装，使用 PIS staged driver root，启用 Toolkit/device plugin 和 file-based runtime config |
+| [`gpu-operator-rtx6000-values.yaml`](../azure-init-review/gpu-operator-rtx6000-values.yaml) | GPU Operator 配置 | 禁用 driver 安装，自动发现节点预装驱动，启用 Toolkit/device plugin 和 file-based runtime config |
 | [`rtx6000-cuda-smoke-job.yaml`](../azure-init-review/rtx6000-cuda-smoke-job.yaml) | 真实 GPU 计算验证 | 申请一个 GPU，通过 CUDA Driver API 运行 PTX kernel 并逐项校验 65,536 个结果 |
 
 ## 为什么旧 JSON 看起来像乱码
@@ -28,14 +28,14 @@ jq -r '.[0].script' azure-init-review/pis-scripts-rtx6000.json
 
 [`rtx6000-driver-install.sh`](../azure-init-review/rtx6000-driver-install.sh) 使用 Microsoft-hosted Azure GRID vGPU runfile，并执行以下步骤：
 
-1. 在 Ubuntu x86-64 环境安装当前 kernel 对应 headers、DKMS 和 build dependencies。
+1. 在 Ubuntu x86-64 环境安装当前 kernel 对应 headers、DKMS、build dependencies 和标准 `nvidia-modprobe` 工具；后者只依赖 libc，不安装另一套 GPU driver。
 2. 从 Microsoft 下载并固定 Azure GRID vGPU `595.91.07` artifact；要求 HTTPS ETag 匹配且文件大小正确，并运行 runfile 自带的 `--check`。
 3. 按 Azure NCv6 指引以 open kernel module 和 DKMS 安装；验证 `nvidia`、`nvidia_uvm`、`nvidia_modeset`、`nvidia_drm` 模块文件、driver version 和 kernel vermagic。
-4. 将 kernel modules 归档到 `/opt/aks-custom-nvidia-driver/modules/<kernel>`，并把恢复 helper 放到 `/usr/local/sbin/aks-custom-nvidia-restore-modules`。节点 `Ready` 后，由 [`rtx6000-module-restore-daemonset.yaml`](../azure-init-review/rtx6000-module-restore-daemonset.yaml) 在目标 RTX pool 上运行该 helper；这避免修改 AKS 管理的 kubelet systemd unit。
-5. 把 GRID 用户态 libraries 与版本匹配的 `nvidia-smi` 放在 `/opt/aks-custom-nvidia-driver/root`，供节点检查和后续 runtime 集成测试使用。`nvidia-smi` 从匹配的 Ubuntu utility package 中只提取 binary，不安装 Ubuntu NVIDIA kernel driver，也不覆盖 GRID libraries；这不代表 GPU Operator 或容器 runtime 已配置完成。
-6. 在 `/etc/aks-custom-nvidia-driver` 记录 artifact、kernel、module archive、restore helper 和 driver root。
+4. 提取与 GRID 版本匹配的 `nvidia-smi` binary，验证原生路径的 NVML、CUDA libraries 和 `nvidia-modprobe`。不安装 Ubuntu NVIDIA kernel driver，也不复制第二份 driver root。
+5. 写入 `/etc/modules-load.d/aks-custom-nvidia.conf`，加载 `nvidia`、`nvidia_modeset`、`nvidia_uvm`、`nvidia_drm`，更新当前 kernel 的 initramfs。
+6. 校验完成后移除基础镜像遗留的 `/opt/azure/aks-gpu/dkms-marker`，防止 AKS 把新安装的自定义驱动当作旧 managed CUDA driver 清理；记录 artifact、kernel 和启动配置到 `/etc/aks-custom-nvidia-driver`。
 
-Azure 文档将 NCv6 RTX PRO 6000 BSE 的 vGPU20.2 (`595.91.07`) 列为受支持的 GRID driver。通用 NVIDIA runfile 即使版本号相同，也不是该 Azure vGPU package；Ubuntu `nvidia-driver-595-server` 同样不包含 Azure GRID vGPU 支持。此前试验和根因详见 [runbook 实测](./azure-init-review-runbook.md#78-rtx-pis-自定义-driver-canary-实测与修正)。
+Azure 文档将 NCv6 RTX PRO 6000 BSE 的 vGPU20.2 (`595.91.07`) 列为受支持的 GRID driver。通用 NVIDIA runfile 即使版本号相同，也不是该 Azure vGPU package；Ubuntu `nvidia-driver-595-server` 同样不包含 Azure GRID vGPU 支持。模块被删除的根因和实测状态见 [runbook](./azure-init-review-runbook.md#78-rtx-pis-自定义-driver-canary-实测与修正)。
 
 安装器不安装 CUDA Toolkit、Kubernetes NVIDIA device plugin 或 GPU Operator，也不运行性能测试。GPU Pod 调度还需要单独配置 device plugin；不能将“驱动已安装”等同于“GPU 已可调度”。
 
@@ -78,10 +78,10 @@ jq -r '.[0].script' azure-init-review/pis-scripts-rtx6000.json | bash -n
 
 ## 当前验证结果
 
-- PIS version：`custom-azure-grid-595.91.07-v5-postready-restore`，预置 Azure GRID `595.91.07`，不修改 kubelet。
-- 节点 Ready 后，由恢复 DaemonSet 加载四个 NVIDIA 模块；首次启动和一次重启后的模块恢复均通过。
-- GPU Operator v26.7.2 / Toolkit v1.20.1 已安装，GPU capacity/allocatable 为 1/1。
-- Operator CUDA validator 与独立 GPU Job 的真实计算均通过；性能对照和长期稳定性尚未测试。
+- 已在全新节点上复现模块删除，日志与部署版本的 AKS 清理代码一致。
+- v6 `custom-azure-grid-595.91.07-v6-native-modules` 已改为原生驱动路径和标准启动加载，无恢复 helper、模块归档或 kubelet hook。
+- 8 项本地回归测试通过；v6 全新节点的模块、DKMS 注册和原生工具均保留，UVM/MIG 设备自动创建，不需要人工恢复。
+- Operator CUDA validator 与独立 GPU Job 均通过；干净 `0 → 1` 扩容 1 分 37 秒 Ready、2 分 31 秒完成 CUDA 校验，详见 [扩缩容实测](./azure-init-review-runbook.md#扩缩容实测)。
 
 ## GPU Operator 配置
 
@@ -90,8 +90,6 @@ jq -r '.[0].script' azure-init-review/pis-scripts-rtx6000.json | bash -n
 ```yaml
 driver:
   enabled: false
-hostPaths:
-  driverInstallDir: /opt/aks-custom-nvidia-driver/root
 toolkit:
   enabled: true
   env:
@@ -101,7 +99,7 @@ devicePlugin:
   enabled: true
 ```
 
-`hostPaths.driverInstallDir` 指向 PIS 安装器归档的匹配版本 driver userspace，使 Operator validator 和 Toolkit 能发现并注入 libraries 与 `nvidia-smi`；这个参数不负责安装 kernel driver。完整配置还包含 Spot toleration、RTX pool 的 NFD worker selector、`mig.strategy=single`，并关闭 MIG manager（不改变 Azure 提供的 MIG partition）和 DCGM exporter（本次只验收调度与计算）。完整文件见 [`gpu-operator-rtx6000-values.yaml`](../azure-init-review/gpu-operator-rtx6000-values.yaml)；安装及 GPU Job 命令见 [runbook](./azure-init-review-runbook.md#78-rtx-pis-自定义-driver-canary-实测与修正)。
+不覆盖 `hostPaths`；Operator validator 通过默认 `/host` 挂载自动发现节点预装驱动，Toolkit 使用同一原生驱动路径。完整配置还包含 Spot toleration、RTX pool 的 NFD worker selector、`mig.strategy=single`，并关闭 MIG manager（不改变 Azure 提供的 MIG partition）和 DCGM exporter（本次只验收调度与计算）。完整文件见 [`gpu-operator-rtx6000-values.yaml`](../azure-init-review/gpu-operator-rtx6000-values.yaml)；安装及 GPU Job 命令见 [runbook](./azure-init-review-runbook.md#78-rtx-pis-自定义-driver-canary-实测与修正)。
 
 ## 官方资料
 

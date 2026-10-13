@@ -666,13 +666,13 @@ az aks nodepool wait \
 
 ### 7.8 RTX PIS 自定义 driver canary 实测与修正
 
-**验证通过（2026-10-13）：PIS 预置自定义 GRID driver，GPU Operator 提供 Toolkit 和 device plugin，GPU Pod 已完成真实 CUDA 计算。**
+**验证通过（2026-10-14，北京时间）：v6 已修复旧 managed-driver 标记触发的误清理；全新节点自动加载自定义 GRID driver，GPU Operator 和真实 CUDA 计算通过，无恢复 DS。**
 
 | 项目 | 当前配置 |
 | --- | --- |
 | Cluster / pool | `aks-rtx-pis-wus2-lab` / `rtxcustom` |
 | SKU / GPU | `Standard_NC24lds_xl_RTXPRO6000BSE_v6` Spot / RTX PRO 6000 `DC-1-24Q`，24 GiB |
-| PIS version / driver | `custom-azure-grid-595.91.07-v5-postready-restore` / Azure GRID `595.91.07` |
+| PIS version / driver | `custom-azure-grid-595.91.07-v6-native-modules` / Azure GRID `595.91.07` |
 | GPU stack | GPU Operator v26.7.2 / Toolkit v1.20.1 / device plugin v0.20.1 |
 | 节点环境 | AKS `1.36.1`，Ubuntu 24.04.5，kernel `6.8.0-1067-azure`，containerd `2.3.3-2` |
 
@@ -680,7 +680,7 @@ az aks nodepool wait \
 
 1. 使用 [Azure NCv6 GRID driver](https://learn.microsoft.com/en-us/azure/virtual-machines/linux/n-series-driver-setup)，不用通用 NVIDIA runfile 或 Ubuntu driver 包。
 2. 自定义 pool 设置 `--gpu-driver None --enable-managed-gpu false`；Operator 设置 `driver.enabled=false`，保留 PIS driver。
-3. 节点 Ready 后，由 [`rtx6000-module-restore-daemonset.yaml`](../azure-init-review/rtx6000-module-restore-daemonset.yaml) 恢复并加载 PIS 归档的模块，不修改 kubelet。
+3. PIS 安装并校验 GRID driver 后移除失效的 `/opt/azure/aks-gpu/dkms-marker`。通过 `/etc/modules-load.d/aks-custom-nvidia.conf` 自动加载四个模块，保留标准 `nvidia-modprobe` 工具，不修改 AKS provisioning 脚本或 kubelet，也不使用恢复 DS。
 4. Toolkit 设置 `RUNTIME_CONFIG_SOURCE=file`，从磁盘读取 containerd 配置，生成与 AKS 根配置兼容的 version 2 drop-in。
 
 完整配置见 [`gpu-operator-rtx6000-values.yaml`](../azure-init-review/gpu-operator-rtx6000-values.yaml)，核心参数如下：
@@ -688,8 +688,6 @@ az aks nodepool wait \
 ```yaml
 driver:
   enabled: false
-hostPaths:
-  driverInstallDir: /opt/aks-custom-nvidia-driver/root
 toolkit:
   enabled: true
   env:
@@ -699,24 +697,55 @@ devicePlugin:
   enabled: true
 ```
 
-`hostPaths.driverInstallDir` 指向 PIS 归档的 driver libraries 和 `nvidia-smi`。完整 values 还包含 RTX pool 的 NFD worker selector 和 Spot toleration；`mig.strategy=single` 暴露一个 GPU，关闭 MIG manager 以保留 Azure 提供的 partition。本次未启用 DCGM exporter。
 
-#### 验证结果
+Operator 不覆盖 `hostPaths`，通过默认 `/host` 挂载自动发现节点预装驱动；无需 staged driver root。完整 values 包含 RTX pool 的 NFD worker selector、Spot toleration 和 `mig.strategy=single`，关闭 MIG manager 以保留 Azure partition，未启用 DCGM exporter。预装驱动检测实现见 [NVIDIA validator](https://github.com/NVIDIA/gpu-operator/blob/v26.7.2/cmd/nvidia-validator/main.go#L773)。
+
+#### 模块丢失的根因
+
+在全新节点上复现，证据如下：
+
+1. 基础镜像 `AKSUbuntu-2404gen2containerd-202609.15.0` 启用了 `NVIDIA_CUDA_PREBAKE`；遗留标记仍记录 `driver_version=580.159.04`、`driver_kind=cuda`，而 PIS 已安装 GRID `595.91.07`。
+2. AKS 对不安装 managed driver 的节点调用 `cleanUpGPUDrivers`。其中 `cleanUpPrebakedGPUDriver` 只判断标记是否存在，不区分 PIS 替换后的驱动。
+3. GPU 节点的 provisioning 日志直接记录了删除 `/var/lib/dkms/nvidia`、`/lib/modules/<kernel>/updates/dkms/nvidia*.ko*` 和 NVIDIA 工具的命令。最终模块目录为空，`nvidia-modprobe`、`nvidia-smi` 也缺失；不是 kubelet 删除模块。
+
+代码与部署镜像 commit `582261913935c3c1e2253c6acad3d4964ea42abf` 一致，参见 [清理调用条件](https://github.com/Azure/AgentBaker/blob/582261913935c3c1e2253c6acad3d4964ea42abf/parts/linux/cloud-init/artifacts/cse_main.sh#L646) 和 [标记检查及删除实现](https://github.com/Azure/AgentBaker/blob/582261913935c3c1e2253c6acad3d4964ea42abf/parts/linux/cloud-init/artifacts/ubuntu/cse_install_ubuntu.sh#L322)。
+
+v6 在驱动校验成功后移除已失效的旧标记，让标准启动机制加载原生模块；不通过延迟恢复、手工 `mknod` 或修改 AKS 清理代码绕过问题。该标记属于此 AKS 镜像版本的实现细节，更新 node image 后需重新检查清理逻辑并验收。
+
+#### 原生方案验证结果
 
 | 验证项 | 实测结果 |
 | --- | --- |
-| 节点及组件 | 两节点、ClusterPolicy、Toolkit、device plugin、validator 均 Ready |
-| containerd | 根配置和 NVIDIA drop-in 均为 version 2 |
-| 活动驱动 | PIS 的 `595.91.07`，Operator 不安装 driver |
-| GPU 资源 | `nvidia.com/gpu` capacity / allocatable = `1 / 1` |
+| 根因复现 | 全新节点确认 AKS 删除模块和工具 |
+| 本地回归 | 8 项通过；覆盖标记清理、失败退出、标准模块配置、JSON 生成及 Operator 默认驱动发现配置 |
+| v6 镜像准备 | Succeeded，耗时 24 分 46 秒 |
+| 模块及工具 | 四个 `595.91.07` 模块完整保留并自动加载；DKMS 仅注册该版本，标准 `nvidia-modprobe` 保留 |
+| UVM / MIG 设备 | 自动创建，未执行人工 `modprobe` 或 `mknod` |
+| 节点及 runtime | Ready；containerd / kubelet active，根配置和 NVIDIA drop-in 均为 version 2 |
+| GPU Operator / 资源 | ClusterPolicy、Toolkit、device plugin、validator Ready；GPU capacity/allocatable = 1/1 |
 | Operator CUDA validator | 50,000 元素向量加法通过 |
-| 独立 GPU Job | CUDA kernel 的 65,536 个结果全部校验通过；Job Complete |
+| 独立 GPU Job | 全新节点上的 65,536 个结果全部校验通过，Job Complete |
 
-独立测试见 [`rtx6000-cuda-smoke-job.yaml`](../azure-init-review/rtx6000-cuda-smoke-job.yaml)：申请一个 GPU，使用 `runtimeClassName=nvidia`，通过 CUDA Driver API 执行 PTX kernel 并校验结果。此结果证明调度和 GPU 计算可用；性能对照、长期稳定性及完整 Operator stack 的重启/节点替换恢复尚未测试。
+独立测试见 [`rtx6000-cuda-smoke-job.yaml`](../azure-init-review/rtx6000-cuda-smoke-job.yaml)：申请一个 GPU，使用 `runtimeClassName=nvidia`，通过 CUDA Driver API 执行 PTX kernel 并校验 65,536 个结果。性能对照、长期稳定性、完整 Operator stack 的重启和 Spot 驱逐恢复尚未测试。
+
+#### 扩缩容实测
+
+使用最终配置做干净 `0 → 1` 扩容，全新节点无需人工修补。计时起点为 AKS operation startTime `2026-10-13T16:16:40Z`：
+
+| 验证项 | 实测结果 |
+| --- | --- |
+| 新节点 Ready | 1 分 37 秒 |
+| AKS 扩容操作 Succeeded | 1 分 38 秒 |
+| CUDA Job Complete | 2 分 31 秒 |
+| 测试后 `1 → 0` 缩容 | 1 分 20 秒；pool count / VMSS capacity 均为 0 |
+
+CUDA 完成耗时包含 GPU 组件就绪和测试镜像拉取；PIS 镜像准备的 24 分 46 秒不计入后续扩容耗时。此结果不是 GPU 性能基准。
+
+开始本轮根因排查时，两个 GPU 池都已缩到 0。本轮始终最多运行一台测试 GPU，现已恢复 `rtxcustom` 到 0，`rtxspot` 仍为 0；自动扩缩容未启用。
 
 #### 安装和验证命令
 
-从项目根目录运行。实验集群本机直连 API 为 Forbidden，因此使用 `az aks command invoke`：
+从项目根目录运行。目标 pool 须已引用上述 v6 PIS、关闭 managed GPU 和默认 driver 安装，并有至少一个 Ready 节点。实验结束时 GPU 池缩回 0，重测先通过 `az aks nodepool scale --node-count 1` 扩容并等待成功。本机直连 API 为 Forbidden，因此使用 `az aks command invoke`：
 
 ```bash
 az aks command invoke \
@@ -728,7 +757,7 @@ az aks command invoke \
     helm repo update nvidia;
     helm upgrade --install gpu-operator nvidia/gpu-operator \
       --version v26.7.2 --namespace gpu-operator --create-namespace \
-      -f gpu-operator-rtx6000-values.yaml;
+      --reset-values -f gpu-operator-rtx6000-values.yaml;
     kubectl wait --for=condition=Ready clusterpolicy/cluster-policy --timeout=300s;
     kubectl -n gpu-operator get pods -o wide'
 
@@ -742,11 +771,11 @@ az aks command invoke \
     kubectl -n gpu-operator logs job/rtx6000-cuda-smoke'
 ```
 
-已完成的 Job 保留在集群中，可直接检查日志。再次 apply 不会重新计算；重测时，确认旧 Job 已完成后，仅删除 `gpu-operator` namespace 中的 `rtx6000-cuda-smoke` Job，再重新 apply。
+再次 apply 已完成的 Job 不会重新计算；重测时，确认旧 Job 已完成后，仅删除 `gpu-operator` namespace 中的 `rtx6000-cuda-smoke` Job，再重新 apply。缩到 0 前先保存测试日志；节点删除后，Job 的 Complete 状态不保证 Pod 日志仍可读取。
 
 ## 8. 相关文档
 
-- [PIS 概述：Prepared Image Specification (PIS) in Azure Kubernetes Service (AKS) (Preview)](https://learn.microsoft.com/en-us/azure/aks/prepared-image-specification-overview)
+- [Prepared Image Specification (PIS) in Azure Kubernetes Service (AKS) (Preview) - Azure Kubernetes Service | Microsoft Learn](https://learn.microsoft.com/en-us/azure/aks/prepared-image-specification-overview)
 - [创建和管理 AKS Prepared Image Specification (PIS) (Preview)](https://learn.microsoft.com/en-us/azure/aks/prepared-image-specification)
 - [PIS customization JSON 说明](./pis-scripts-explained.md)
 - [AKS 自管 NVIDIA GPU driver](https://learn.microsoft.com/en-us/azure/aks/use-nvidia-gpu)

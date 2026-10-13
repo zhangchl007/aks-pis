@@ -23,7 +23,7 @@ spec:
           imagePullPolicy: IfNotPresent
           resources:
             limits:
-              nvidia.com/gpu: 1
+              nvidia.com/gpu: "1"
           command: [python, -u, -c]
           args:
             - |
