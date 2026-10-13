@@ -10,13 +10,13 @@
 
 PIS customization 只解码、校验和安装这些文件；**不会 source、执行或下载其中任何初始化脚本**。这一区分是强制安全边界：此审阅包不是可直接部署的初始化版本。
 
-> **禁止直接运行包内脚本。** [README.md](../azure-init-review/README.md) 明确说明该包含脱敏占位值。当前副本使用 `.example.invalid` 主机名、`192.0.2.x` 文档示例地址和 `REDACTED_AUTHORIZATION`；这些不是生产端点或有效凭据。运行前必须由服务所有者提供已批准、完整且经过安全审查的生产版本。
+源码包以脱敏占位值展示原脚本结构，不能直接作为部署配置。[README.md](../azure-init-review/README.md) 说明了提取与验证范围；当前 PIS bundle 只复制审阅文件，不执行包内初始化脚本。
 
 ### 每日重建 node pool 的实测结论
 
 对每天删除并新建节点池的工作流，**不要把 PIS 作为默认路径**。PIS 会在关联它的 node pool create/update 流程中准备镜像；每次新建池都可能再次触发这项准备。Microsoft Learn 将其收益定位在镜像准备后的重复 scale-out，并指出初次 create/update 会因构建镜像而更慢。
 
-在 `taugrid-phase1-itn`（`italynorth`、Kubernetes `1.35.7`）使用同一 `Standard_D4as_v6` 做了实测：
+在同一隔离 AKS canary 集群中，以相同的测试 VM SKU 和 Ubuntu 配置做了实测：
 
 | 测试 | AKS operation 时间 | 节点结果 |
 | --- | ---: | --- |
@@ -25,11 +25,11 @@ PIS customization 只解码、校验和安装这些文件；**不会 source、�
 | PIS 池，仅 `echo` 简单脚本 | 18 分 00 秒 | `Succeeded`，节点 `Ready` |
 | 普通 Ubuntu 池，不关联 PIS | 1 分 19 秒 | `Succeeded`，节点 `Ready` |
 
-第二次 PIS 测试中，customization Run Command 从 `01:29:57Z` 到 `01:30:19Z`，约 **22 秒**；generalize Run Command 也约 **22 秒**。额外创建的简单脚本对照中，`echo PIS_NOOP_OK` 从 `02:01:09.913Z` 到 `02:01:32.685Z`，约 **22.8 秒**；generalize 从 `02:02:11.136Z` 到 `02:02:34.046Z`，约 **22.9 秒**。builder VM 于 `02:03:19.748Z` deallocate，目标 node pool VMSS 到 `02:16:35.638Z` 才开始创建，相隔 **13 分 16 秒**；整个 AKS operation 于 `02:17:49Z` 结束，节点随后 `Ready`。因此简化脚本没有显著缩短端到端耗时，脚本复杂度不是主因。
+第二次 PIS 测试中，customization 和 generalize Run Command 各约 **22 秒**。额外创建的简单脚本对照中，`echo PIS_NOOP_OK` 用时约 **22.8 秒**，generalize 约 **22.9 秒**；builder VM deallocate 到目标 node pool VMSS 开始创建之间相隔 **13 分 16 秒**，整个 AKS operation 用时 **18 分钟**，节点随后 `Ready`。因此简化脚本没有显著缩短端到端耗时，脚本复杂度不是主因。
 
 每次新建 PIS 池都会产生临时 builder VMSS；普通池对照在同集群、同 SKU 下 79 秒完成。因此本工作流的可操作根因是：**每天新建池重复进入 PIS 镜像准备路径**。本审阅包只有静态文件复制，没有容器镜像预缓存或其他能补偿该成本的用途。
 
-Activity Log 只记录了 build VM、Run Command 和目标 VMSS 等 ARM 操作；PIS 服务端镜像准备的内部子阶段未暴露，因此不能将 deallocate 后约 12–13 分钟的等待进一步断言为某个特定快照/捕获动作。Microsoft Learn 没有给出初次 PIS 构建的分钟数或时长 SLA；它只说明初次 node pool create/update 会先构建镜像，因此会耗时更长。这个服务端子阶段是否达到产品预期，公开资料无法判定；但该未知项不影响当前修复决策：日常新建池应不使用 PIS。若业务必须使用 PIS 且需要追查内部子阶段，可向 Microsoft Support 提供 PIS 测试的 correlation ID `d25680f4-d973-4e88-99c8-f655f613c564`、简单脚本对照的 operation ID `63730ab2-2655-4d84-9d16-d27fa366d35c` / correlation ID `7ba3aa35-e943-4cf0-b67e-a5e3ceb89386`，以及本文时间线和区域/SKU。
+Activity Log 只记录了 build VM、Run Command 和目标 VMSS 等 ARM 操作；PIS 服务端镜像准备的内部子阶段未暴露，因此不能将 deallocate 后约 12–13 分钟的等待进一步断言为某个特定快照/捕获动作。Microsoft Learn 没有给出初次 PIS 构建的分钟数或时长 SLA；它只说明初次 node pool create/update 会先构建镜像，因此会耗时更长。这个服务端子阶段是否达到产品预期，公开资料无法判定；但该未知项不影响当前修复决策：日常新建池应不使用 PIS。
 
 ## 2. 评审结论：不能将原主脚本作为 PIS build-time 脚本执行
 
@@ -64,7 +64,7 @@ Microsoft 的 AKS [support policies](https://learn.microsoft.com/en-us/azure/aks
 
 Microsoft 的 [AKS DNS 概念文档](https://learn.microsoft.com/en-us/azure/aks/dns-concepts)描述了 Pod DNS 查询经 CoreDNS 并转发到上游的路径；Azure DNS 地址 `168.63.129.16` 还承担 Azure 虚拟网络 DNS 等平台服务，Azure 要求防火墙策略不要误拦截所需的平台通信（见 [168.63.129.16 文档](https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16)）。这不是说每个 AKS 环境都必须把该地址手工写入 `/etc/resolv.conf`；DNS server 应从 AKS / VNet 当前配置确认。Azure Linux VM 时间同步文档指出，时间服务通常由 `ntpd` 或 `chronyd` 提供，并说明 Azure host 常是可靠的时间源（见 [Linux VM time sync](https://learn.microsoft.com/en-us/azure/virtual-machines/linux/time-sync)）；不可据此推断每个 AKS OS SKU 或自定义镜像使用完全相同的 chrony 配置。
 
-**当前交付物的实际影响：** PIS 中的 [`pis-scripts.json`](../azure-init-review/pis-scripts.json) 在 `NodeImageBuildTime` 仅将审阅文件复制到 `/opt/azure-init-review`、校验并以 `0644` 保存；不会调用或 `source` 主脚本及 DNS/NTP 子脚本。因此这些 DNS/NTP 修改目前只是被打包用于审阅，没有应用到 `pisflow` 节点。此前在 canary 节点验证的是文件 checksum 和 `bash -n`，**不是** DNS 变更、NTP 同步或脚本运行兼容性验证。
+**当前交付物的实际影响：** PIS 中的 [`pis-scripts.json`](../azure-init-review/pis-scripts.json) 在 `NodeImageBuildTime` 仅将审阅文件复制到 `/opt/azure-init-review`、校验并以 `0644` 保存；不会调用或 `source` 主脚本及 DNS/NTP 子脚本。因此这些 DNS/NTP 修改目前只是被打包用于审阅，没有应用到 PIS canary 节点。此前在 canary 节点验证的是文件 checksum 和 `bash -n`，**不是** DNS 变更、NTP 同步或脚本运行兼容性验证。
 
 #### 如确有自定义 DNS / NTP 需求
 
@@ -231,7 +231,7 @@ az aks nodepool add \
   --ssh-access disabled
 ```
 
-本次同集群、同 `Standard_D4as_v6` 对照池从 AKS operation 开始到 `Succeeded` 用时 1 分 19 秒，节点为 Ubuntu 24.04.5 / Kubernetes 1.35.7 并进入 `Ready`。本审阅包仅用于审查文件，不需要为了存放它而让每日新建池承担 PIS 镜像准备成本。
+同一 canary 集群中的非 PIS 对照池从 AKS operation 开始到 `Succeeded` 用时 1 分 19 秒，节点为 Ubuntu 24.04.5 / Kubernetes 1.35.7 并进入 `Ready`。本审阅包仅用于审查文件，不需要为了存放它而让每日新建池承担 PIS 镜像准备成本。
 
 ### 6.2 可选：隔离测试 PIS
 
@@ -351,33 +351,32 @@ kubectl delete pod -n "<debug-pod-namespace>" "<debug-pod-name>"
 
 ### 7.1 AKS 1.36.1 / PIS canary 实测
 
-以下是在 `taugrid-phase1-itn`（`italynorth`）于 **2026-10-13 UTC** 的隔离验证。测试池 `pisflow` 使用 `Standard_D4as_v6`、Ubuntu、1 个节点和 `purpose=pis-validation:NoSchedule` 污点；业务节点池没有随本次 canary 节点池升级。
+以下为隔离 AKS canary 集群的验证结果。PIS 测试池使用 Ubuntu、1 个节点和 `purpose=pis-validation:NoSchedule` 污点；业务节点池没有随本次 canary 节点池升级。
 
 | 操作 | AKS operation 时间（UTC） | 用时 | 结果 |
 | --- | --- | ---: | --- |
-| `pisflow` 扩容：1 → 2 节点 | 02:53:00–02:54:43 | 1 分 43 秒 | `Succeeded`；correlation `aaddf725-1533-4133-b86d-7c67d3bf9922`；两个节点 Ready，PIS bundle 均通过 checksum 与 `bash -n` |
-| `pisflow` 缩容：2 → 1 节点 | 02:55:29–02:56:21 | 52 秒 | `Succeeded`；correlation `2a436c14-bc3e-470d-853c-577a0544e6b4`；保留节点 Ready |
-| `pisflow` 将 PIS profile 从 `v1` 更新到测试版 `v2` | 03:01:20–03:30:54 | 29 分 34 秒 | `Succeeded`；operation `18e253fe-d0cf-4057-a7dc-9795a6b300a9` |
-| 仅升级 control plane：Kubernetes `1.35.7` → `1.36.1` | 03:33:53–03:43:52 | 9 分 59 秒 | `Succeeded`；operation `25c6e6e1-784b-461f-9ec4-07dfe182bc28` |
-| 升级 `pisflow` 节点池：Kubernetes `1.35.7` → `1.36.1` | 03:46:12–04:10:16 | 24 分 04 秒 | `Succeeded`；operation `079763c9-f185-49ab-ac93-622ff6735956` |
+| PIS canary pool 扩容：1 → 2 节点 | — | 1 分 43 秒 | `Succeeded`；两个节点 Ready，PIS bundle 均通过 checksum 与 `bash -n` |
+| PIS canary pool 缩容：2 → 1 节点 | — | 52 秒 | `Succeeded`；保留节点 Ready |
+| canary pool 将 PIS profile 从 `v1` 更新到测试版 `v2` | — | 29 分 34 秒 | `Succeeded` |
+| 仅升级 control plane：Kubernetes `1.35.7` → `1.36.1` | — | 9 分 59 秒 | `Succeeded` |
+| 升级 PIS canary pool：Kubernetes `1.35.7` → `1.36.1` | — | 24 分 04 秒 | `Succeeded` |
 
 PIS 版本 `v2` 是仅供此次验证的版本：保留 `v1` 的静态审阅包复制脚本，并额外写入 `/etc/aks-pis-validation/pis-version` 标记；它不执行审阅包内脚本，也不应直接推广为生产配置。
 
-control plane 操作明确使用了 `--control-plane-only`，完成后 `system`、`cpu`、`gpu`、`gput4` 和 `pisflow` 节点池仍报告 `1.35.7`。这说明只升级 control plane 不等于同步升级节点池。随后对 `pisflow` 单独执行 `az aks nodepool upgrade --kubernetes-version 1.36.1`。升级期间，AKS 为引用的 PIS 版本重新执行镜像准备流程；Activity Log 中同一 correlation ID `b893ec04-74ca-4c49-96cc-adf5a0a4c3ef` 记录：
+control plane 操作明确使用了 `--control-plane-only`，完成后业务节点池和 PIS canary pool 仍报告 `1.35.7`。这说明只升级 control plane 不等于同步升级节点池。随后对 PIS canary pool 单独执行 `az aks nodepool upgrade --kubernetes-version 1.36.1`。升级期间，AKS 为引用的 PIS 版本重新执行镜像准备流程：
 
-- PIS builder VMSS 在 `03:46:20Z` 开始创建。
-- PIS customization Run Command 分别在 `03:48:56Z` 和 `03:49:46Z` 成功；Linux generalize 在 `03:50:48Z` 成功。
-- builder VMSS 于 `03:51:44Z` deallocate。约 13 分钟后，surge 节点在 `04:04:48Z` 出现并加入 `v1.36.1` 的 `Ready` 节点；AKS operation 最终于 `04:10:16Z` 成功。
+- PIS builder VMSS 被创建；customization Run Command 和 Linux generalize 均成功，单项执行为十几至二十余秒。
+- builder VMSS deallocate 后约 13 分钟，surge 节点出现并加入 `v1.36.1` 的 `Ready` 节点；AKS operation 最终 `Succeeded`，总耗时约 24 分钟。
 - 验证后的节点仍引用 `pis-review-copy-only/versions/v2`。在最终节点上确认 PIS 版本标记、`SHA256SUMS` 全部校验通过，bundle 内 shell 文件均通过 `bash -n`。
 
 中文 Microsoft Learn 文档说明：Kubernetes 版本升级时，AKS 会为节点池所引用的 PIS 版本自动重新生成 prepared VHD；无需仅为 Kubernetes 版本变化创建新的 PIS version。PIS 内容变化（脚本或容器镜像）才需要新建 PIS version。该自动准备发生在节点池升级流程中；**control-plane-only 升级不会替代节点池升级**。
 
 #### 观察到的影响与边界
 
-- `pisflow` 配置了 `maxSurge: 10%`。单节点池升级期间，VMSS capacity 临时从 1 增至 2；新节点 Ready 后旧节点进入 `SchedulingDisabled`，之后移除 surge 节点。验证池有 NoSchedule 污点，没有业务工作负载调度到该池。
-- surge 节点刚加入时，部分 `kube-system` Pod 短暂处于 `Init` / `ContainerCreating`。升级完成后的检查中，所有活动节点均为 `Ready`，没有 `Pending` 或 `Failed` Pod；`pisflow` 回到 1 个节点。
+- canary pool 配置了 `maxSurge: 10%`。单节点池升级期间，VMSS capacity 临时从 1 增至 2；新节点 Ready 后旧节点进入 `SchedulingDisabled`，之后移除 surge 节点。验证池有 NoSchedule 污点，没有业务工作负载调度到该池。
+- surge 节点刚加入时，部分 `kube-system` Pod 短暂处于 `Init` / `ContainerCreating`。升级完成后的检查中，所有活动节点均为 `Ready`，没有 `Pending` 或 `Failed` Pod；canary pool 回到 1 个节点。
 - control plane 升级前后抽查时，活动节点均为 `Ready`，未观察到 `Pending` 或 `Failed` Pod。此次没有持续探测 API 可用性，也没有对业务工作负载执行请求/事务测试，因此这些检查不能证明整个升级窗口内零中断。
-- 验证结束时，control plane 和 `pisflow` 为 `1.36.1`；`system`、`cpu`、`gpu` 仍为 `1.35.7`，`gput4` 为 0 个节点。业务节点池保留在 `1.35.7` 是本次限定只验证 PIS canary 的结果，不代表它们已升级。
+- 验证结束时，control plane 和 PIS canary pool 为 `1.36.1`；业务节点池仍为 `1.35.7`。业务节点池保留在 `1.35.7` 是本次限定只验证 canary 的结果，不代表它们已升级。
 - 这次 PIS Kubernetes 升级仍花了约 24 分钟，说明即使 customization 很短，PIS 镜像准备和后续滚动节点替换仍会占据升级时间；公开 Activity Log 没有暴露 prepared VHD 服务端各子阶段的详细耗时。
 
 ### 7.2 通用前置检查与变更记录
@@ -609,7 +608,7 @@ az aks upgrade \
 
 - **Kubernetes 版本回滚：** AKS 通常不支持将 Kubernetes 版本降级。不要把回滚 PIS ID 或重建 pool 当作 Kubernetes 降级方案；发生升级故障时先停止继续 rollout，收集 operation/error/Activity Log 并按 AKS 支持流程处理。优先使用 AKS 支持的前向修复版本。
 - **验收：** cluster/pool provisioning state 为 `Succeeded`；control plane 与目标 pool 的版本符合计划；PIS profile 指向预期版本；目标 pool 节点数量正确且全部 `Ready`；没有未解释的 Pending/Failed Pod；PIS 文件 checksum/语法验证通过；应用自身健康检查、关键请求/事务和监控恢复正常。
-- **清理测试池：** 确认池中无工作负载且变更审批允许后，删除专用测试池；不要对生产池执行删除操作。清理本次 `pisflow` 前，需确认用户不再需要保留该 canary。
+- **清理测试池：** 确认池中无工作负载且变更审批允许后，删除专用测试池；不要对生产池执行删除操作。清理 canary 前，需确认用户不再需要保留该池。
 
 若要把这些脚本从“文件”升级成真正的节点初始化行为，应另行设计受支持的节点生命周期机制，逐项处理下表中的环境依赖、幂等、失败恢复、权限、网络来源、密钥管理和磁盘安全，并在非生产环境测试。不要直接把完整主脚本改成 `NodeImageBuildTime` customization。
 

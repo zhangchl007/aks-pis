@@ -43,6 +43,14 @@ Microsoft Learn 没有给出 PIS 初次构建的分钟数或时长 SLA；文档�
 
 本示例使用 Ubuntu Linux 节点。按官方文档要求，准备 Azure CLI 2.85.0 或更高版本、`aks-preview` 扩展 21.0.0b5 或更高版本，并注册 `AKSPreparedImageSpecificationPreview` 功能。Linux PIS 支持的 OS SKU 请以[官方 PIS 文档](https://learn.microsoft.com/en-us/azure/aks/prepared-image-specification-overview)为准。
 
+### AKS Kubernetes 版本要求
+
+Microsoft Learn 的 PIS [创建与管理文档](https://learn.microsoft.com/en-us/azure/aks/prepared-image-specification)要求现有 AKS 集群运行**受支持的 Kubernetes 版本**，但没有指定 PIS 专属的最低 Kubernetes minor 或 patch 版本。因此，不应推断 PIS 必须使用某个特定版本（例如 `1.35`）；应以 [AKS 当前支持版本及其生命周期](https://learn.microsoft.com/en-us/azure/aks/supported-kubernetes-versions)和目标区域的 `az aks get-upgrades` / `az aks nodepool get-upgrades` 结果为准。
+
+这与 PIS 自身的预览前置条件不同：官方列出了 Azure CLI / `aks-preview` 版本、订阅 feature 注册、公共区域范围和支持的 OS；它们不是 Kubernetes 版本下限。AKS Kubernetes 升级时，会为节点池引用的 PIS version 自动重新生成 prepared VHD；无需仅为 Kubernetes 版本变化创建新的 PIS version。脚本或容器镜像内容变更时应创建新 PIS version；PIS 概述另建议在 AKS node image 更新时通过新版本保持 prepared image 更新。Kubernetes 版本升级与 AKS node image 更新是不同操作，应分别依据[创建与管理文档](https://learn.microsoft.com/en-us/azure/aks/prepared-image-specification)和[PIS 概述](https://learn.microsoft.com/en-us/azure/aks/prepared-image-specification-overview)执行。
+
+本项目的 canary 实测覆盖了 Kubernetes `1.35.7` 上创建 PIS node pool，以及随后将 PIS node pool 升级到 `1.36.1`，两者均成功。这是已验证组合的实测证据，不代表 PIS 支持范围的最低/最高版本声明。
+
 ```bash
 az --version
 
