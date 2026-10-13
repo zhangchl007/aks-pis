@@ -49,6 +49,30 @@ Activity Log 只记录了 build VM、Run Command 和目标 VMSS 等 ARM 操作�
 
 此外，Azure 官方 PIS 文档指出，customization script 失败可能导致 image build 或 scale-up 失败；脚本和容器镜像同时使用时，脚本先运行，再进行镜像缓存。更多 PIS 约束见[官方文档](https://learn.microsoft.com/en-us/azure/aks/prepared-image-specification-overview)。
 
+### 2.1 DNS / NTP 对 AKS 托管节点的合规性与风险评估
+
+**结论：当前 PIS bundle 不会应用这些 DNS/NTP 改动；如果把审阅包中的原主脚本直接运行在 AKS agent node 上，则不符合推荐的 AKS 节点管理方式，应视为高风险、未获 AKS 支持确认的 host-level customization，不应部署。** 本节是对源码行为和 Microsoft Learn 支持边界的静态评估，不表示已在生产节点执行或验证了这些脚本。
+
+Microsoft 的 AKS [support policies](https://learn.microsoft.com/en-us/azure/aks/support-policies#shared-responsibility) 要求通过 Kubernetes-native 机制管理节点改动，并说明直接修改 agent node 会影响 AKS 支持范围；[custom node configuration](https://learn.microsoft.com/en-us/azure/aks/custom-node-configuration) 只支持文档列出的 OS / kubelet 参数，超出范围应使用文档建议的机制，不要靠启动脚本随意更改受管节点 OS。细节仍需按使用的 AKS 版本、OS SKU 和具体配置与 Microsoft Support 确认。
+
+| 项目 | 源码实际行为 | 合规性判断 | 主要风险 |
+| --- | --- | --- | --- |
+| 节点 DNS | [`k8s_init.azure.redacted.sh`](../azure-init-review/k8s_init.azure.redacted.sh) 将 DNS 写入 `/etc/resolv.conf`；[`dns_update_workspace.sh`](../azure-init-review/initialization/scripts/dns_update_workspace.sh) 在 Ubuntu/Debian 上停止并禁用 `systemd-resolved`、删除其 resolver 文件链接/文件、从 CMDB 写入 nameserver，并对 `/etc/resolv.conf` 设置 immutable (`chattr +i`)。 | **不建议 / 高风险。** 直接改 agent node resolver、禁用系统 resolver、锁定文件都不属于 AKS 的常规 DNS 配置入口；源码没有证明该做法在 AKS 受支持。 | 可能破坏节点 bootstrap、控制面/注册表/镜像仓库等名称解析和 Pod 的上游 DNS；VNet/Private DNS 变化后节点文件不会自动跟进；规模扩缩或升级后的节点可能配置不一致；immutable 属性可能阻止 OS/AKS 管理流程更新 resolver。 |
+| 节点 NTP | [`ntpdate_set.sh`](../azure-init-review/initialization/scripts/ntpdate_set.sh) 与 [`ntpdate_eu_set.sh`](../azure-init-review/initialization/scripts/ntpdate_eu_set.sh) 会修改 chrony 配置、注释现有 `server` / `pool` 行、追加按区域选定的内部时间源并重启/启用服务；也会清理匹配旧时间源的 root cron 项。 | **不建议 / 高风险。** 对受管节点替换 OS 默认 time-sync 配置属于未验证的 host-level customization；没有源代码证据表明该自定义源是 AKS 要求。 | endpoint 不可达、DNS 错误、UDP/123 被阻断或 unit/config 路径与 Ubuntu 版本不符时，节点可能失去可靠校时；脚本对实际同步状态的失败处理不足。时钟漂移会影响 TLS 证书校验、令牌有效期、日志关联及分布式任务时序。 |
+| 示例地址与参数 | 当前脱敏副本中的 `192.0.2.x` 属于文档示例地址，`.example.invalid` 为不可解析占位域名；主脚本还把 `is_i8n` 参数作为国内/海外 NTP 分支依据，DNS 内容依赖 CMDB 返回值。 | **不可作为生产配置。** 脱敏副本不能证明生产中的 DNS/NTP 地址有效、获批或可路由。 | 如照此副本执行，DNS 初始 nameserver 与用于探测源 IP 的地址不可用于生产；真实脚本即使替换占位符，也仍须验证每个返回地址和环境分支，不能把 CMDB 响应直接当作可信 DNS 配置。 |
+| 其他主机设置 | 主脚本还会停止 firewalld、修改 SELinux 配置、强制将时区设为 `Asia/Shanghai`，并停用 `node_exporter`。 | **未通过受管节点配置审核。** 这类节点 OS/service/security posture 变更同样不应作为未批准的通用 AKS init 脚本部署。 | 防火墙或 SELinux 关闭会降低节点防护；停用 exporter 会造成监控盲区；固定本地时区可能造成日志/运维时间解释不一致。时区不是 NTP，也不能修复时钟同步。 |
+
+Microsoft 的 [AKS DNS 概念文档](https://learn.microsoft.com/en-us/azure/aks/dns-concepts)描述了 Pod DNS 查询经 CoreDNS 并转发到上游的路径；Azure DNS 地址 `168.63.129.16` 还承担 Azure 虚拟网络 DNS 等平台服务，Azure 要求防火墙策略不要误拦截所需的平台通信（见 [168.63.129.16 文档](https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16)）。这不是说每个 AKS 环境都必须把该地址手工写入 `/etc/resolv.conf`；DNS server 应从 AKS / VNet 当前配置确认。Azure Linux VM 时间同步文档指出，时间服务通常由 `ntpd` 或 `chronyd` 提供，并说明 Azure host 常是可靠的时间源（见 [Linux VM time sync](https://learn.microsoft.com/en-us/azure/virtual-machines/linux/time-sync)）；不可据此推断每个 AKS OS SKU 或自定义镜像使用完全相同的 chrony 配置。
+
+**当前交付物的实际影响：** PIS 中的 [`pis-scripts.json`](../azure-init-review/pis-scripts.json) 在 `NodeImageBuildTime` 仅将审阅文件复制到 `/opt/azure-init-review`、校验并以 `0644` 保存；不会调用或 `source` 主脚本及 DNS/NTP 子脚本。因此这些 DNS/NTP 修改目前只是被打包用于审阅，没有应用到 `pisflow` 节点。此前在 canary 节点验证的是文件 checksum 和 `bash -n`，**不是** DNS 变更、NTP 同步或脚本运行兼容性验证。
+
+#### 如确有自定义 DNS / NTP 需求
+
+1. **DNS：** 先确定是节点出站解析、Pod 外部域名解析还是 Kubernetes service 域名解析。节点上游解析优先按 [AKS 自定义 DNS 指引](https://learn.microsoft.com/en-us/azure/aks/dns-concepts)配置 VNet / subnet DNS，并确认自定义解析器对 AKS 节点可达、能转发 Azure/Private DNS 所需区域，且支持 UDP 与 TCP 53；Pod 转发策略使用 AKS 支持的 CoreDNS / LocalDNS 配置方式。不要直接覆盖 `/etc/resolv.conf`、禁用 `systemd-resolved` 或设置 immutable。
+2. **NTP：** 先只读检查目标 AKS OS image 的当前服务、同步状态和 source；不要因为 Ubuntu VM 上存在 chrony 就替换它，也不要因“集群有 NTP”而假设任何自定义镜像都配置正确。若合规要求强制企业 NTP，先确认 AKS 支持边界、时间源路由/防火墙、DNS 依赖、区域一致性和同步监控，并取得平台团队/Microsoft 对所选节点配置方式的确认；保留原始配置和可回退方案。
+3. **静态只读检查：** 在获批的 canary 节点上查看 `readlink -f /etc/resolv.conf`、`systemctl is-active systemd-resolved chrony chronyd`、`timedatectl show -p NTPSynchronized -p TimeUSec`、`chronyc tracking` 与 `chronyc sources -v`（仅在相应工具存在时）。不要运行初始化脚本；分享诊断输出前先脱敏 DNS/NTP 地址和内部域名。
+4. **验收标准：** 节点重新创建、scale-out 和升级后配置仍一致；节点与 Pod 分别能解析 AKS API/镜像仓库、Azure/Private DNS 与预期服务名；NTP 同步为正常且 source 符合审批；无 CoreDNS/LocalDNS、节点注册、镜像拉取、证书验证或时间告警。仅 `bash -n` 或看到配置文件存在不构成运行合规性验收。
+
 ## 3. 产物与内容
 
 生成的 [`pis-scripts.json`](../azure-init-review/pis-scripts.json) 使用一个 `Bash` / `NodeImageBuildTime` customization script。它会：
@@ -323,12 +347,269 @@ kubectl get pods --all-namespaces | grep node-debugger
 kubectl delete pod -n "<debug-pod-namespace>" "<debug-pod-name>"
 ```
 
-## 7. 更新、推广与回滚
+## 7. 版本升级、推广与回滚
 
-- **源脚本或 bundle 改变：** 重新运行生成器；先审核源变更和生成 JSON，再创建新的 PIS version。不要尝试覆盖已使用版本的内容。
-- **测试通过后推广：** 依据变更审批，将 PIS version ID 关联到目标 node pool；监控 node pool 更新、节点 Ready、DNS、镜像拉取和 workload 健康状况。当前 bundle 只验证文件是否存在，不代表包内初始化逻辑已经生产化。
-- **回滚：** 将 node pool 更新回上一个已验证的 PIS version ID，并监控 rollout 完成。保留前一版 ID、节点池配置和审批记录。
-- **清理测试池：** 确认池中无工作负载且变更审批允许后，删除专用测试池；不要对生产池执行删除操作。
+### 7.1 AKS 1.36.1 / PIS canary 实测
+
+以下是在 `taugrid-phase1-itn`（`italynorth`）于 **2026-10-13 UTC** 的隔离验证。测试池 `pisflow` 使用 `Standard_D4as_v6`、Ubuntu、1 个节点和 `purpose=pis-validation:NoSchedule` 污点；业务节点池没有随本次 canary 节点池升级。
+
+| 操作 | AKS operation 时间（UTC） | 用时 | 结果 |
+| --- | --- | ---: | --- |
+| `pisflow` 扩容：1 → 2 节点 | 02:53:00–02:54:43 | 1 分 43 秒 | `Succeeded`；correlation `aaddf725-1533-4133-b86d-7c67d3bf9922`；两个节点 Ready，PIS bundle 均通过 checksum 与 `bash -n` |
+| `pisflow` 缩容：2 → 1 节点 | 02:55:29–02:56:21 | 52 秒 | `Succeeded`；correlation `2a436c14-bc3e-470d-853c-577a0544e6b4`；保留节点 Ready |
+| `pisflow` 将 PIS profile 从 `v1` 更新到测试版 `v2` | 03:01:20–03:30:54 | 29 分 34 秒 | `Succeeded`；operation `18e253fe-d0cf-4057-a7dc-9795a6b300a9` |
+| 仅升级 control plane：Kubernetes `1.35.7` → `1.36.1` | 03:33:53–03:43:52 | 9 分 59 秒 | `Succeeded`；operation `25c6e6e1-784b-461f-9ec4-07dfe182bc28` |
+| 升级 `pisflow` 节点池：Kubernetes `1.35.7` → `1.36.1` | 03:46:12–04:10:16 | 24 分 04 秒 | `Succeeded`；operation `079763c9-f185-49ab-ac93-622ff6735956` |
+
+PIS 版本 `v2` 是仅供此次验证的版本：保留 `v1` 的静态审阅包复制脚本，并额外写入 `/etc/aks-pis-validation/pis-version` 标记；它不执行审阅包内脚本，也不应直接推广为生产配置。
+
+control plane 操作明确使用了 `--control-plane-only`，完成后 `system`、`cpu`、`gpu`、`gput4` 和 `pisflow` 节点池仍报告 `1.35.7`。这说明只升级 control plane 不等于同步升级节点池。随后对 `pisflow` 单独执行 `az aks nodepool upgrade --kubernetes-version 1.36.1`。升级期间，AKS 为引用的 PIS 版本重新执行镜像准备流程；Activity Log 中同一 correlation ID `b893ec04-74ca-4c49-96cc-adf5a0a4c3ef` 记录：
+
+- PIS builder VMSS 在 `03:46:20Z` 开始创建。
+- PIS customization Run Command 分别在 `03:48:56Z` 和 `03:49:46Z` 成功；Linux generalize 在 `03:50:48Z` 成功。
+- builder VMSS 于 `03:51:44Z` deallocate。约 13 分钟后，surge 节点在 `04:04:48Z` 出现并加入 `v1.36.1` 的 `Ready` 节点；AKS operation 最终于 `04:10:16Z` 成功。
+- 验证后的节点仍引用 `pis-review-copy-only/versions/v2`。在最终节点上确认 PIS 版本标记、`SHA256SUMS` 全部校验通过，bundle 内 shell 文件均通过 `bash -n`。
+
+中文 Microsoft Learn 文档说明：Kubernetes 版本升级时，AKS 会为节点池所引用的 PIS 版本自动重新生成 prepared VHD；无需仅为 Kubernetes 版本变化创建新的 PIS version。PIS 内容变化（脚本或容器镜像）才需要新建 PIS version。该自动准备发生在节点池升级流程中；**control-plane-only 升级不会替代节点池升级**。
+
+#### 观察到的影响与边界
+
+- `pisflow` 配置了 `maxSurge: 10%`。单节点池升级期间，VMSS capacity 临时从 1 增至 2；新节点 Ready 后旧节点进入 `SchedulingDisabled`，之后移除 surge 节点。验证池有 NoSchedule 污点，没有业务工作负载调度到该池。
+- surge 节点刚加入时，部分 `kube-system` Pod 短暂处于 `Init` / `ContainerCreating`。升级完成后的检查中，所有活动节点均为 `Ready`，没有 `Pending` 或 `Failed` Pod；`pisflow` 回到 1 个节点。
+- control plane 升级前后抽查时，活动节点均为 `Ready`，未观察到 `Pending` 或 `Failed` Pod。此次没有持续探测 API 可用性，也没有对业务工作负载执行请求/事务测试，因此这些检查不能证明整个升级窗口内零中断。
+- 验证结束时，control plane 和 `pisflow` 为 `1.36.1`；`system`、`cpu`、`gpu` 仍为 `1.35.7`，`gput4` 为 0 个节点。业务节点池保留在 `1.35.7` 是本次限定只验证 PIS canary 的结果，不代表它们已升级。
+- 这次 PIS Kubernetes 升级仍花了约 24 分钟，说明即使 customization 很短，PIS 镜像准备和后续滚动节点替换仍会占据升级时间；公开 Activity Log 没有暴露 prepared VHD 服务端各子阶段的详细耗时。
+
+### 7.2 通用前置检查与变更记录
+
+下面的命令以 Bash、Azure CLI、`kubectl` 和已经登录的正确 subscription 为前提。开始前复核订阅、cluster、resource group、目标 pool、维护窗口和变更审批；不要把示例变量原样用于生产。若 PIS 和 AKS cluster 位于同一个 resource group，`PIS_RESOURCE_GROUP` 与 `RESOURCE_GROUP` 设置为相同值。后续涉及工作区文件的命令从仓库根目录运行。
+
+```bash
+export RESOURCE_GROUP="<aks-resource-group>"
+export CLUSTER_NAME="<aks-cluster-name>"
+export NODE_POOL="<target-nodepool>"
+export PIS_RESOURCE_GROUP="<pis-resource-group>"
+export PIS_NAME="<prepared-image-specification-name>"
+
+az account show --query '{subscription:id,name:name}' -o yaml
+az aks show -g "${RESOURCE_GROUP}" -n "${CLUSTER_NAME}" \
+  --query '{location:location,state:provisioningState,kubernetesVersion:kubernetesVersion}' -o yaml
+az aks nodepool show -g "${RESOURCE_GROUP}" --cluster-name "${CLUSTER_NAME}" \
+  -n "${NODE_POOL}" \
+  --query '{state:provisioningState,count:count,autoscaling:enableAutoScaling,min:minCount,max:maxCount,kubernetesVersion:currentOrchestratorVersion,nodeImageVersion:nodeImageVersion,pisId:preparedImageSpecificationProfile.preparedImageSpecificationId,taints:nodeTaints}' \
+  -o yaml
+
+az aks get-credentials -g "${RESOURCE_GROUP}" -n "${CLUSTER_NAME}" --overwrite-existing
+kubectl get nodes -o wide
+kubectl get pods -A --field-selector=status.phase=Pending -o wide
+kubectl get pods -A --field-selector=status.phase=Failed -o wide
+```
+
+如果 cluster 或 pool 不是 `Succeeded`、现有节点不是健康状态、存在未处理的 Pending/Failed workload，先查明原因并暂停变更。操作期间记录 UTC 开始/结束时间、operation ID、状态、节点数量/Ready 状态、PIS version、Kubernetes 版本和业务健康探测结果。`kubectl get nodes` 和 Pod phase 只是抽样；生产变更还需使用应用自己的 readiness、请求/事务探测和告警。
+
+### 7.3 扩容与缩容 PIS node pool
+
+手动调整固定节点数时，先检查 quota、子网 IP、VM SKU 容量、PDB 和可用容量。启用 cluster autoscaler 的池应按批准的 `minCount` / `maxCount` 调整，不要用手动 scale 与 autoscaler 相互覆盖。缩容会驱逐并终止节点上的 Pod；先确认 workload 有足够副本、PDB 可满足且目标节点无不可丢失的本地状态。AKS 会执行节点池缩容流程，不要用删除 VMSS 实例代替。
+
+```bash
+export TARGET_COUNT=2
+printf 'scale-out submit UTC: '; date -u '+%Y-%m-%dT%H:%M:%SZ'
+az aks nodepool scale \
+  --resource-group "${RESOURCE_GROUP}" \
+  --cluster-name "${CLUSTER_NAME}" \
+  --name "${NODE_POOL}" \
+  --node-count "${TARGET_COUNT}"
+printf 'scale-out returned UTC: '; date -u '+%Y-%m-%dT%H:%M:%SZ'
+```
+
+等待预期数量的节点加入且全部 `Ready`；同时确认 pool operation 已成功：
+
+```bash
+az aks operation show-latest -g "${RESOURCE_GROUP}" -n "${CLUSTER_NAME}" \
+  --nodepool-name "${NODE_POOL}" -o jsonc
+az aks nodepool show -g "${RESOURCE_GROUP}" --cluster-name "${CLUSTER_NAME}" \
+  -n "${NODE_POOL}" --query '{state:provisioningState,count:count}' -o yaml
+kubectl get nodes -l "agentpool=${NODE_POOL}" -o wide
+kubectl wait --for=condition=Ready nodes \
+  -l "agentpool=${NODE_POOL}" --timeout=15m
+```
+
+验证**每个**新增节点的 PIS 内容，而不是只抽查一个节点。参照 §6.3 获取该 pool 的 node names，在各节点上用 `kubectl debug node/<node> --profile=sysadmin` 只读检查 `/opt/azure-init-review/SHA256SUMS` 与 shell 语法；不要执行包内脚本。检查完成后删除 debug Pod。
+
+缩容到目标数量前，先确认目标数量及 autoscaler 设置符合审批；随后用相同方式执行：
+
+```bash
+export TARGET_COUNT=1
+printf 'scale-in submit UTC: '; date -u '+%Y-%m-%dT%H:%M:%SZ'
+az aks nodepool scale \
+  --resource-group "${RESOURCE_GROUP}" \
+  --cluster-name "${CLUSTER_NAME}" \
+  --name "${NODE_POOL}" \
+  --node-count "${TARGET_COUNT}"
+printf 'scale-in returned UTC: '; date -u '+%Y-%m-%dT%H:%M:%SZ'
+```
+
+缩容后确认 pool count、剩余节点 Ready、Pod 分布及应用健康。若 operation 失败或长期无进展，停止重复提交并保留 operation/Activity Log 证据。
+
+### 7.4 更新 PIS customization / prepared image version
+
+PIS 版本内容不可原地覆盖。脚本、容器镜像或其他 PIS 输入发生变化时，创建**新的唯一版本**，先在隔离 canary pool 更新和验证，再按审批推广。单纯 Kubernetes 版本升级不需要另建 PIS version：AKS 会为被引用的 PIS 自动重建 prepared VHD。
+
+```bash
+export NEW_PIS_VERSION="review-bundle-v3"
+export LOCATION="$(
+  az aks show -g "${RESOURCE_GROUP}" -n "${CLUSTER_NAME}" --query location -o tsv
+)"
+export PIS_JSON="azure-init-review/pis-scripts.json"
+
+# 先确认新版本名称尚未使用、JSON 内容符合预期且不含 secret。
+az aks prepared-image-specification version list \
+  --resource-group "${PIS_RESOURCE_GROUP}" --pis-name "${PIS_NAME}" -o table
+jq '.[].name' "${PIS_JSON}"
+
+az aks prepared-image-specification create \
+  --resource-group "${PIS_RESOURCE_GROUP}" \
+  --name "${PIS_NAME}" \
+  --version "${NEW_PIS_VERSION}" \
+  --location "${LOCATION}" \
+  --customization-scripts "@${PIS_JSON}"
+
+export NEW_PIS_VERSION_ID="$(
+  az aks prepared-image-specification version show \
+    --resource-group "${PIS_RESOURCE_GROUP}" \
+    --pis-name "${PIS_NAME}" \
+    --name "${NEW_PIS_VERSION}" \
+    --query id -o tsv
+)"
+test -n "${NEW_PIS_VERSION_ID}"
+printf 'candidate PIS version: %s\n' "${NEW_PIS_VERSION_ID}"
+```
+
+PIS version resource 创建成功**不表示 prepared VHD 已准备好**。把新 version 先关联到 canary pool；此更新可能重新执行 PIS customization、generalize、准备镜像并替换节点，须按长时操作监控：
+
+```bash
+export OLD_PIS_VERSION_ID="$(
+  az aks nodepool show -g "${RESOURCE_GROUP}" --cluster-name "${CLUSTER_NAME}" \
+    -n "${NODE_POOL}" \
+    --query preparedImageSpecificationProfile.preparedImageSpecificationId -o tsv
+)"
+test -n "${OLD_PIS_VERSION_ID}"
+printf 'old PIS: %s\nnew PIS: %s\n' "${OLD_PIS_VERSION_ID}" "${NEW_PIS_VERSION_ID}"
+printf 'PIS version rollout submit UTC: '; date -u '+%Y-%m-%dT%H:%M:%SZ'
+
+az aks nodepool update \
+  --resource-group "${RESOURCE_GROUP}" \
+  --cluster-name "${CLUSTER_NAME}" \
+  --name "${NODE_POOL}" \
+  --prepared-image-specification-id "${NEW_PIS_VERSION_ID}"
+
+printf 'PIS version rollout returned UTC: '; date -u '+%Y-%m-%dT%H:%M:%SZ'
+az aks operation show-latest -g "${RESOURCE_GROUP}" -n "${CLUSTER_NAME}" \
+  --nodepool-name "${NODE_POOL}" -o jsonc
+```
+
+只有当 operation 为 `Succeeded`、pool 的 `preparedImageSpecificationProfile.preparedImageSpecificationId` 等于候选 ID、节点 Ready 且 PIS 内容验证通过后，才允许推广到其他 pool。记录 operation 和 PIS builder/VMSS Activity Log 的 correlation ID；builder deallocate 并不代表 pool operation 已完成。
+
+**区分 PIS 内容更新与 AKS node OS image 更新：** 修改 PIS script/image 内容时创建新的 PIS version 并更新 pool profile，如上所述。AKS 基础 Ubuntu/node image 有更新时，使用以下检查和 node image-only 操作；这不会更改 PIS version ID，也不能代替 PIS 内容版本变更。对关联 PIS 的 pool，实际升级期间需同样跟踪 PIS/VMSS Activity Log，并在节点 Ready 后重新验证 PIS profile 和文件。
+
+```bash
+az aks nodepool get-upgrades \
+  --resource-group "${RESOURCE_GROUP}" \
+  --cluster-name "${CLUSTER_NAME}" \
+  --nodepool-name "${NODE_POOL}" \
+  --query '{current:kubernetesVersion,latestNodeImageVersion:latestNodeImageVersion,upgrades:upgrades}' \
+  -o yaml
+
+printf 'node image-only upgrade submit UTC: '; date -u '+%Y-%m-%dT%H:%M:%SZ'
+az aks nodepool upgrade \
+  --resource-group "${RESOURCE_GROUP}" \
+  --cluster-name "${CLUSTER_NAME}" \
+  --name "${NODE_POOL}" \
+  --node-image-only \
+  --yes
+printf 'node image-only upgrade returned UTC: '; date -u '+%Y-%m-%dT%H:%M:%SZ'
+az aks operation show-latest -g "${RESOURCE_GROUP}" -n "${CLUSTER_NAME}" \
+  --nodepool-name "${NODE_POOL}" -o jsonc
+```
+
+仅当 upgrade profile 显示存在较新的 `latestNodeImageVersion` 时执行；若它与当前 pool 的 `nodeImageVersion` 一致或升级 profile 没有可用更新，不要为了验证而重复触发。Azure CLI 当前提供 `az aks nodepool upgrade --node-image-only`，操作前再次用 `az aks nodepool upgrade -h` 确认本地 CLI/aks-preview 版本支持该参数。
+
+### 7.5 升级 AKS Kubernetes 版本（control plane 和节点池）
+
+先确认目标版本属于 AKS 返回的可升级版本，目标 node pool 的升级 profile 也允许该版本；Kubernetes 版本升级应按 control plane 后 node pool 的顺序执行，node pool 版本不得高于 control plane。检查 workload API deprecation/兼容性、PDB、容量、配额和 subnet IP，准备维护窗口及回滚/恢复方案。
+
+```bash
+export TARGET_K8S_VERSION="<version-listed-by-aks>"
+
+az aks get-upgrades -g "${RESOURCE_GROUP}" -n "${CLUSTER_NAME}" -o table
+az aks nodepool list -g "${RESOURCE_GROUP}" --cluster-name "${CLUSTER_NAME}" \
+  --query '[].{name:name,state:provisioningState,count:count,version:currentOrchestratorVersion,pis:preparedImageSpecificationProfile.preparedImageSpecificationId}' \
+  -o table
+az aks nodepool get-upgrades -g "${RESOURCE_GROUP}" \
+  --cluster-name "${CLUSTER_NAME}" --nodepool-name "${NODE_POOL}" -o jsonc
+```
+
+对需要分批/先 canary 验证的变更，先只升级 control plane：
+
+```bash
+printf 'control plane upgrade submit UTC: '; date -u '+%Y-%m-%dT%H:%M:%SZ'
+az aks upgrade \
+  --resource-group "${RESOURCE_GROUP}" \
+  --name "${CLUSTER_NAME}" \
+  --kubernetes-version "${TARGET_K8S_VERSION}" \
+  --control-plane-only \
+  --yes
+printf 'control plane upgrade returned UTC: '; date -u '+%Y-%m-%dT%H:%M:%SZ'
+az aks show -g "${RESOURCE_GROUP}" -n "${CLUSTER_NAME}" \
+  --query '{state:provisioningState,version:kubernetesVersion}' -o yaml
+```
+
+control plane 成功后，**这一步不会同步升级任何 node pool**。先升级 PIS canary pool，并按 §7.4 的长时操作监控、检查 PIS profile 与节点/工作负载；然后对每个获批 pool 逐一执行：
+
+```bash
+printf 'node pool upgrade submit UTC: '; date -u '+%Y-%m-%dT%H:%M:%SZ'
+az aks nodepool upgrade \
+  --resource-group "${RESOURCE_GROUP}" \
+  --cluster-name "${CLUSTER_NAME}" \
+  --name "${NODE_POOL}" \
+  --kubernetes-version "${TARGET_K8S_VERSION}" \
+  --yes
+printf 'node pool upgrade returned UTC: '; date -u '+%Y-%m-%dT%H:%M:%SZ'
+az aks operation show-latest -g "${RESOURCE_GROUP}" -n "${CLUSTER_NAME}" \
+  --nodepool-name "${NODE_POOL}" -o jsonc
+```
+
+引用 PIS 的 pool 在 Kubernetes 升级时，AKS 会自动为已引用的 PIS version 重新生成 prepared VHD；无需仅因 Kubernetes 版本变化新建 PIS version。预期耗时包含镜像准备与节点滚动替换，应预留时间。逐个 pool 等到 operation `Succeeded`、目标版本正确、节点 Ready、应用探测通过后，再推进下一个 pool。
+
+如果变更审批明确允许一次性升级**整个 cluster 的所有 node pools**，可以在确认 `az aks get-upgrades` 返回目标版本并评估所有 pool 的维护影响后，使用：
+
+```bash
+az aks upgrade \
+  --resource-group "${RESOURCE_GROUP}" \
+  --name "${CLUSTER_NAME}" \
+  --kubernetes-version "${TARGET_K8S_VERSION}" \
+  --yes
+```
+
+该命令未指定 `--control-plane-only` 时，会升级 control plane **和所有 node pools**，包括引用 PIS 的池；不应将其用于只想验证某个 canary pool 的变更。升级中记录 cluster operation、各 pool 状态及 PIS builder 事件。不要同时对同一 cluster 发起第二个升级/更新操作。
+
+### 7.6 回滚与验收
+
+- **PIS version 回滚：** 先保存上一版 PIS ID，再把目标 node pool 的 profile 更新回该 ID：
+
+  ```bash
+  az aks nodepool update \
+    --resource-group "${RESOURCE_GROUP}" \
+    --cluster-name "${CLUSTER_NAME}" \
+    --name "${NODE_POOL}" \
+    --prepared-image-specification-id "${OLD_PIS_VERSION_ID}"
+  ```
+
+  这仍然是 node pool update，可能再次准备镜像并滚动替换节点，不是瞬时切换。等待 operation 成功后复验版本 ID、节点 Ready、PIS bundle 和 workload。
+
+- **Kubernetes 版本回滚：** AKS 通常不支持将 Kubernetes 版本降级。不要把回滚 PIS ID 或重建 pool 当作 Kubernetes 降级方案；发生升级故障时先停止继续 rollout，收集 operation/error/Activity Log 并按 AKS 支持流程处理。优先使用 AKS 支持的前向修复版本。
+- **验收：** cluster/pool provisioning state 为 `Succeeded`；control plane 与目标 pool 的版本符合计划；PIS profile 指向预期版本；目标 pool 节点数量正确且全部 `Ready`；没有未解释的 Pending/Failed Pod；PIS 文件 checksum/语法验证通过；应用自身健康检查、关键请求/事务和监控恢复正常。
+- **清理测试池：** 确认池中无工作负载且变更审批允许后，删除专用测试池；不要对生产池执行删除操作。清理本次 `pisflow` 前，需确认用户不再需要保留该 canary。
 
 若要把这些脚本从“文件”升级成真正的节点初始化行为，应另行设计受支持的节点生命周期机制，逐项处理下表中的环境依赖、幂等、失败恢复、权限、网络来源、密钥管理和磁盘安全，并在非生产环境测试。不要直接把完整主脚本改成 `NodeImageBuildTime` customization。
 
@@ -336,6 +617,11 @@ kubectl delete pod -n "<debug-pod-namespace>" "<debug-pod-name>"
 
 - [PIS 概述：Prepared Image Specification (PIS) in Azure Kubernetes Service (AKS) (Preview)](https://learn.microsoft.com/en-us/azure/aks/prepared-image-specification-overview)
 - [创建和管理 AKS Prepared Image Specification (PIS) (Preview)](https://learn.microsoft.com/en-us/azure/aks/prepared-image-specification)
+- [AKS Support Policies / agent node shared responsibility](https://learn.microsoft.com/en-us/azure/aks/support-policies#shared-responsibility)
+- [Customize the Node Configuration for AKS Node Pools](https://learn.microsoft.com/en-us/azure/aks/custom-node-configuration)
+- [DNS in AKS](https://learn.microsoft.com/en-us/azure/aks/dns-concepts)
+- [Azure IP 168.63.129.16 Overview](https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16)
+- [Time sync for Linux VMs in Azure](https://learn.microsoft.com/en-us/azure/virtual-machines/linux/time-sync)
 - [PIS 脚本审阅包说明](../azure-init-review/README.md)
 - [PIS Bash 打包 JSON](../azure-init-review/pis-scripts.json)
 - [PIS JSON 生成器](../tools/build_azure_init_pis.py)
